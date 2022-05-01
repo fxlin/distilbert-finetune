@@ -16,7 +16,7 @@ from sklearn.naive_bayes import BernoulliNB
 # xzl: this???
 os.environ["WANDB_DISABLED"] = "true"
 
-device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+device = torch.device("cuda:2") if torch.cuda.is_available() else torch.device("cpu")
 # xzl
 # hyperparamters
 config_batch_size = 8
@@ -99,7 +99,8 @@ eval_dataloader = DataLoader(
 )
 
 config_num_NB = int(sys.argv[1])
-fixed_loss_threshold = float(sys.argv[2])
+# fixed_loss_threshold = float(sys.argv[2])
+stage0_steps = float(sys.argv[2])
 optimizer = AdamW(model.parameters(), lr=5e-5)
 num_epochs = 1   # xzl. default:3
 
@@ -122,7 +123,7 @@ loss_history = np.array([], dtype=np.float32)
 loss_history_eff = np.array([], dtype=np.float32)   # effective. actual loss in training
 
 # loss_threshold = 0 # 0.4 # 0.4   # higher -> skip more; lower -> skip less
-loss_threshold = fixed_loss_threshold
+loss_threshold = 0
 loss_threshold_history = []
 
 #for picking examples based on rankings in a minibatch. only backprop these examples
@@ -141,6 +142,7 @@ length_list = []
 classifier_acc = []
 classifier_correct = 0
 total = 0
+stage1_step_counter = 0
 
 for epoch in range(num_epochs):
 
@@ -164,130 +166,104 @@ for epoch in range(num_epochs):
     progress_bar = tqdm(range(len(train_dataloader) * config_batch_size))
 
     for step, batch in enumerate(train_dataloader):
+        print(loss_threshold)
+        ###############Stage 0################
         batch = {k: v.to(device) for k, v in batch.items()}
-        sentence_lengths = []
-        bow = np.zeros((config_batch_size, tokenizer.vocab_size))
-
         # Fwd the whole batch
         model.eval()
         outputs = model(**batch)
-        # word_embeddings = model.distilbert.embeddings.word_embeddings(batch['input_ids'])
-        # word_embeddings = torch.reshape(word_embeddings, (word_embeddings.shape[0], -1))
-        # gate_mask = gate(word_embeddings).squeeze()
 
-        # Naive Bayes Classification
-        for i in range(batch['input_ids'].shape[0]):
-            for index, j in enumerate(batch['input_ids'][i]):
-                if batch['attention_mask'][i][index] == 1:
-                    bow[i][j] += 1
+        loss = torch.nn.CrossEntropyLoss(reduction='none')(outputs.logits,batch['labels'])  # per example loss
+        # loss history of all samples... discarded or not ...
+        loss_history = np.concatenate((loss_history, loss.cpu().detach().numpy()))
+        # if loss_threshold <= fixed_loss_threshold and loss_threshold != -1:
 
-        # for i, v in enumerate(bow[0]):
-        #     if v >= 1:
-        #         print((i, v, '非零'))
-            # sentence = tokenizer.decode(batch['input_ids'][i])
-            # sentence_lengths.append(torch.count_nonzero(batch['input_ids'][i]).item())
-
-        if config_per_sample:
-            loss = torch.nn.CrossEntropyLoss(reduction='none')(outputs.logits,
-                                                               batch['labels'])  # per example loss
-            # loss history of all samples... discarded or not ...
-            loss_history = np.concatenate((loss_history, loss.cpu().detach().numpy()))
-            # for i in range(len(sentence_lengths)):
-            #     length_loss_list.append(loss[i].item())
-            #     length_list.append(sentence_lengths[i])
-
-            #fixed threshold
-            loss_threshold = fixed_loss_threshold
-            # features = np.array(sentence_lengths).reshape((len(sentence_lengths), 1))
-            features = bow
-            target = np.array(loss.detach().cpu().numpy() > loss_threshold).astype(np.int32)
-            if step < config_num_NB:
+        if step > stage0_steps:
+            stage1_step_counter += 1
+            # Naive Bayes Classification
+            bow = np.zeros((config_batch_size, tokenizer.vocab_size))
+            for i in range(batch['input_ids'].shape[0]):
+                for index, j in enumerate(batch['input_ids'][i]):
+                    if batch['attention_mask'][i][index] == 1:
+                        bow[i][j] += 1
+            if config_per_sample:
+                features = bow
+                target = np.array(loss.detach().cpu().numpy() > loss_threshold).astype(np.int32)
                 bnb.partial_fit(features,y=target, classes=np.array([0,1]))
-            pred = bnb.predict(features)
-            print(pred, target)
-            if step >= config_num_NB:
-                total += config_batch_size
-                classifier_correct += (target == pred).astype(np.int32).sum()
-                print('Classifier Accuracy. Test on train set:', classifier_correct/total)
-                classifier_acc.append(classifier_correct/total)
+                # print(( "stage 1:", loss_threshold))
 
-            #backprop based on loss threshold
-            # for idx, l in enumerate(loss):
-            #     if l >= loss_threshold:
-            #         for k in ['input_ids', 'attention_mask', 'labels']:
-            #             # staged_batch[k] = torch.cat(staged_batch[k], batch[k][idx])
-            #             staged_batch[k].append(batch[k][idx])
-            #     else:
-            #         skip_counter += 1
+                ###############Stage 2################
+                if stage1_step_counter >= config_num_NB:
+                    pred = bnb.predict(features)
+                    # print(pred, target)
+                    total += config_batch_size
+                    classifier_correct += (target == pred).astype(np.int32).sum()
+                    print('Classifier Accuracy. Test on train set:', classifier_correct/total)
+                    classifier_acc.append(classifier_correct/total)
 
-            # backprop based on loss threshold
-            for idx, l in enumerate(pred):
-                if l == 1:
-                    for k in ['input_ids', 'attention_mask', 'labels']:
-                        # staged_batch[k] = torch.cat(staged_batch[k], batch[k][idx])
-                        staged_batch[k].append(batch[k][idx])
+                    # backprop based on loss threshold
+                    for idx, l in enumerate(pred):
+                        if l == 1:
+                            for k in ['input_ids', 'attention_mask', 'labels']:
+                                # staged_batch[k] = torch.cat(staged_batch[k], batch[k][idx])
+                                staged_batch[k].append(batch[k][idx])
+                        else:
+                            skip_counter += 1
+
+                ###############Stage 1################
                 else:
-                    skip_counter += 1
+                    for idx, l in enumerate(loss):
+                        if l >= loss_threshold:
+                            for k in ['input_ids', 'attention_mask', 'labels']:
+                                # staged_batch[k] = torch.cat(staged_batch[k], batch[k][idx])
+                                staged_batch[k].append(batch[k][idx])
+                        else:
+                            skip_counter += 1
+                    # adjust loss threshold ... moving avg
+                    if len(loss_history) > config_n_window:
+                        loss_threshold = np.average(loss_history[-config_n_window:])
+                        loss_threshold_history.append((step * config_batch_size - skip_counter, loss_threshold))
 
-                    #######################################
-            # # adjust loss threshold ... moving avg
-            if len(loss_history) > config_n_window:
-                loss_threshold = np.average(loss_history[-config_n_window:])
-                loss_threshold_history.append((step * config_batch_size - skip_counter, loss_threshold))
-            # optimizer.zero_grad()  # just in case ...
+                n_batches = len(staged_batch['input_ids'])
+                if n_batches < config_batch_size:
+                    continue
 
-            # less than 1 batch for backprop ... later
-            # n_batches = staged_batch['input_ids'].size(dim=0)
-            n_batches = len(staged_batch['input_ids'])
-            # print("n_batches = ", n_batches)
-            if n_batches < config_batch_size:
-                continue
+                for k in ['input_ids', 'attention_mask', 'labels']:
+                    batch[k] = torch.stack(staged_batch[k][0:config_batch_size]).to(device)  # already on device??
+                    staged_batch[k] = staged_batch[k][config_batch_size:]
 
-            # has a batch to backprop ... split a batch of 8
-            # https://pytorch.org/docs/stable/generated/torch.split.html
-            # batch = {'input_ids':[], 'attention_mask':[], 'labels':[]}
+            else:  # per minibatch
+                loss = outputs.loss
+                # loss_history.append(loss.cpu().detach().numpy())
+                # np.concatenate((loss_history, loss.cpu().detach().numpy()))
+                loss_history = np.append(loss_history, loss.item())
 
-            for k in ['input_ids', 'attention_mask', 'labels']:
-                batch[k] = torch.stack(staged_batch[k][0:config_batch_size]).to(device)  # already on device??
-                staged_batch[k] = staged_batch[k][config_batch_size:]
+                # length_loss_list.append(loss.item())
+                # sentence_lengths = sum(sentence_lengths) / len(sentence_lengths)
+                # length_list.append(int(sentence_lengths))
 
-        else:  # per minibatch
-            loss = outputs.loss
-            # loss_history.append(loss.cpu().detach().numpy())
-            # np.concatenate((loss_history, loss.cpu().detach().numpy()))
-            loss_history = np.append(loss_history, loss.item())
+                #######################################
+                # adjust loss threshold ... moving avg
+                win = int(config_n_window / config_batch_size)
+                if len(loss_history) > win:
+                    loss_threshold = np.average(loss_history[-config_n_window:])
+                    loss_threshold_history.append((step * config_batch_size - skip_counter, loss_threshold))
 
-            # length_loss_list.append(loss.item())
-            # sentence_lengths = sum(sentence_lengths) / len(sentence_lengths)
-            # length_list.append(int(sentence_lengths))
-
-            #######################################
-            # adjust loss threshold ... moving avg
-            win = int(config_n_window / config_batch_size)
-            if len(loss_history) > win:
-                loss_threshold = np.average(loss_history[-config_n_window:])
-                loss_threshold_history.append((step * config_batch_size - skip_counter, loss_threshold))
-
-            if loss.item() < loss_threshold:
-                skip_counter += config_batch_size
-                optimizer.zero_grad()  # just in case ...
-                continue
+                if loss.item() < loss_threshold:
+                    skip_counter += config_batch_size
+                    optimizer.zero_grad()  # just in case ...
+                    continue
 
         model.train()
         outputs = model(**batch)
         loss = outputs.loss
         loss.backward()
-        # Clip the norm of the gradients to 1.0.
-        # This is to help prevent the "exploding gradients" problem.
-        # torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
         optimizer.step()
         lr_scheduler.step()
         optimizer.zero_grad()
 
-        # loss is a tensor containing a single val
         total_loss += loss.item()
-        # loss_history_eff.append((step, loss.item(), 1))   # 1 means backprop
-        # loss history of samples for training ... i.e. not discarded ...
         if config_per_sample:
             per_sample_loss = torch.nn.CrossEntropyLoss(reduction='none')(outputs.logits,
                                                                           batch['labels'])  # per example loss
@@ -300,17 +276,14 @@ for epoch in range(num_epochs):
             metric_train.add_batch(predictions=predictions, references=batch["labels"])
         progress_bar.update(config_batch_size)
 
-    # Calculate the average loss over the training data.
-    # avg_train_loss = total_loss / len(train_dataloader)
     avg_train_loss = total_loss / (len(train_dataloader) - skip_counter / config_batch_size)  # xzl
-
-    # Store the loss value for plotting the learning curve.
     loss_values.append(avg_train_loss)
 
     print("\nTraining Accuracy: ", metric_train.compute())
     print("  Average training loss: {:}".format(avg_train_loss))
     print("  Training epcoh took: {:}m {:}s".format(*epoch_time(t0, time.time())))
-    print(f"  skipped {skip_counter} samples, {100 * skip_counter / config_batch_size / len(train_dataloader):.2f}%",
+    skip_ratio = 100 * skip_counter / config_batch_size / len(train_dataloader)
+    print(f"  skipped {skip_counter} samples, {skip_ratio:.2f}%",
           "loss_threshold", loss_threshold)
 
     # ========================================
@@ -342,11 +315,10 @@ for epoch in range(num_epochs):
         metric_test.add_batch(predictions=predictions, references=batch["labels"])
 
     print("  Validation took: {:}m {:}s".format(*epoch_time(t0, time.time())))
-    val_acc = metric_test.compute()
+    val_acc = metric_test.compute()['accuracy']
     print("Validation Accuracy: ", val_acc)
-    np.save("{}_classifier_train_step_thresh_{}_val_acc.npy".format(config_num_NB, fixed_loss_threshold), val_acc['accuracy'])
-
-# np.save("{}_classifier_train_step_thresh_{}.npy".format(config_num_NB, fixed_loss_threshold), np.array(classifier_acc))
+    np.save("0find1adp2fix/{}_stage0_{}_stage1_SkipRatio_ValAcc_ClsAcc.npy".format(stage0_steps, config_num_NB), np.array([skip_ratio, val_acc, classifier_acc[-1]]))
+    np.save("0find1adp2fix/{}_stage0_{}_stage1_ClsAcc_all.npy".format(stage0_steps, config_num_NB), np.array(classifier_acc))
 
 
 # print(loss_history)

@@ -14,7 +14,8 @@ from tqdm.auto import tqdm
 # # load pre-trained
 # #  ... many weights are not init'd... random??
 tokenizer = AutoTokenizer.from_pretrained('distilbert-base-uncased')
-metric = load_metric("accuracy")
+metric_train = load_metric("accuracy")
+metric_test = load_metric("accuracy")
 
 def to_bin_class(ex):
 	ex['label'] = round(ex['label'])
@@ -37,7 +38,7 @@ def epoch_time(start_time, end_time):
 class FCGate(torch.nn.Module):
     def __init__(self, in_channels=10, out_channels=8):
         super(FCGate, self).__init__()
-        self.linear_layer = torch.nn.Linear(in_channels, out_channels)
+        self.linear_layer = torch.nn.Linear(in_channels, out_channels, bias=False)
         self.linear_layer1 = torch.nn.Linear(768, out_channels)
         self.prob_layer = torch.nn.Sigmoid()
 
@@ -52,7 +53,5 @@ class FCGate(torch.nn.Module):
             prob.detach() + prob
         # x = x.view(x.size(0), 1)
         return x
-
-
 
 

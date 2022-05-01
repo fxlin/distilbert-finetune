@@ -201,55 +201,55 @@ for epoch in range(num_epochs):
             # features = np.array(sentence_lengths).reshape((len(sentence_lengths), 1))
             features = bow
             target = np.array(loss.detach().cpu().numpy() > loss_threshold).astype(np.int32)
-            if step < config_num_NB:
-                bnb.partial_fit(features,y=target, classes=np.array([0,1]))
-            pred = bnb.predict(features)
-            print(pred, target)
+            bnb.partial_fit(features,y=target, classes=np.array([0,1]))
+            # if step < config_num_NB:
+            #     print(step)
+            #     # backprop based on loss threshold
+            #     for idx, l in enumerate(loss):
+            #         if l >= loss_threshold:
+            #             for k in ['input_ids', 'attention_mask', 'labels']:
+            #                 # staged_batch[k] = torch.cat(staged_batch[k], batch[k][idx])
+            #                 staged_batch[k].append(batch[k][idx])
+            #         else:
+            #             skip_counter += 1
             if step >= config_num_NB:
+                pred = bnb.predict(features)
+                # print(pred, target)
                 total += config_batch_size
                 classifier_correct += (target == pred).astype(np.int32).sum()
                 print('Classifier Accuracy. Test on train set:', classifier_correct/total)
                 classifier_acc.append(classifier_correct/total)
 
-            #backprop based on loss threshold
-            # for idx, l in enumerate(loss):
-            #     if l >= loss_threshold:
-            #         for k in ['input_ids', 'attention_mask', 'labels']:
-            #             # staged_batch[k] = torch.cat(staged_batch[k], batch[k][idx])
-            #             staged_batch[k].append(batch[k][idx])
-            #     else:
-            #         skip_counter += 1
-
-            # backprop based on loss threshold
-            for idx, l in enumerate(pred):
-                if l == 1:
-                    for k in ['input_ids', 'attention_mask', 'labels']:
-                        # staged_batch[k] = torch.cat(staged_batch[k], batch[k][idx])
-                        staged_batch[k].append(batch[k][idx])
-                else:
-                    skip_counter += 1
+                # backprop based on loss threshold
+                for idx, l in enumerate(pred):
+                    if l == 1:
+                        for k in ['input_ids', 'attention_mask', 'labels']:
+                            # staged_batch[k] = torch.cat(staged_batch[k], batch[k][idx])
+                            staged_batch[k].append(batch[k][idx])
+                    else:
+                        skip_counter += 1
 
                     #######################################
-            # # adjust loss threshold ... moving avg
-            if len(loss_history) > config_n_window:
-                loss_threshold = np.average(loss_history[-config_n_window:])
-                loss_threshold_history.append((step * config_batch_size - skip_counter, loss_threshold))
-            # optimizer.zero_grad()  # just in case ...
+                # # adjust loss threshold ... moving avg
+                # if len(loss_history) > config_n_window:
+                #     loss_threshold = np.average(loss_history[-config_n_window:])
+                #     loss_threshold_history.append((step * config_batch_size - skip_counter, loss_threshold))
+                # optimizer.zero_grad()  # just in case ...
 
-            # less than 1 batch for backprop ... later
-            # n_batches = staged_batch['input_ids'].size(dim=0)
-            n_batches = len(staged_batch['input_ids'])
-            # print("n_batches = ", n_batches)
-            if n_batches < config_batch_size:
-                continue
+                # less than 1 batch for backprop ... later
+                # n_batches = staged_batch['input_ids'].size(dim=0)
+                n_batches = len(staged_batch['input_ids'])
+                # print("n_batches = ", n_batches)
+                if n_batches < config_batch_size:
+                    continue
 
-            # has a batch to backprop ... split a batch of 8
-            # https://pytorch.org/docs/stable/generated/torch.split.html
-            # batch = {'input_ids':[], 'attention_mask':[], 'labels':[]}
+                # has a batch to backprop ... split a batch of 8
+                # https://pytorch.org/docs/stable/generated/torch.split.html
+                # batch = {'input_ids':[], 'attention_mask':[], 'labels':[]}
 
-            for k in ['input_ids', 'attention_mask', 'labels']:
-                batch[k] = torch.stack(staged_batch[k][0:config_batch_size]).to(device)  # already on device??
-                staged_batch[k] = staged_batch[k][config_batch_size:]
+                for k in ['input_ids', 'attention_mask', 'labels']:
+                    batch[k] = torch.stack(staged_batch[k][0:config_batch_size]).to(device)  # already on device??
+                    staged_batch[k] = staged_batch[k][config_batch_size:]
 
         else:  # per minibatch
             loss = outputs.loss
@@ -310,7 +310,8 @@ for epoch in range(num_epochs):
     print("\nTraining Accuracy: ", metric_train.compute())
     print("  Average training loss: {:}".format(avg_train_loss))
     print("  Training epcoh took: {:}m {:}s".format(*epoch_time(t0, time.time())))
-    print(f"  skipped {skip_counter} samples, {100 * skip_counter / config_batch_size / len(train_dataloader):.2f}%",
+    skip_ratio = 100 * skip_counter / config_batch_size / len(train_dataloader)
+    print(f"  skipped {skip_counter} samples, {skip_ratio:.2f}%",
           "loss_threshold", loss_threshold)
 
     # ========================================
@@ -342,11 +343,10 @@ for epoch in range(num_epochs):
         metric_test.add_batch(predictions=predictions, references=batch["labels"])
 
     print("  Validation took: {:}m {:}s".format(*epoch_time(t0, time.time())))
-    val_acc = metric_test.compute()
+    val_acc = metric_test.compute()['accuracy']
     print("Validation Accuracy: ", val_acc)
-    np.save("{}_classifier_train_step_thresh_{}_val_acc.npy".format(config_num_NB, fixed_loss_threshold), val_acc['accuracy'])
-
-# np.save("{}_classifier_train_step_thresh_{}.npy".format(config_num_NB, fixed_loss_threshold), np.array(classifier_acc))
+    np.save("{}_cls_step_thre_{}_SkipRatio_ValAcc_ClsAcc.npy".format(config_num_NB, fixed_loss_threshold), np.array([skip_ratio, val_acc, classifier_acc[-1]]))
+    np.save("{}_cls_step_thre_{}_ClsAcc_all.npy".format(config_num_NB, fixed_loss_threshold), np.array(classifier_acc))
 
 
 # print(loss_history)
