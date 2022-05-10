@@ -16,7 +16,7 @@ from sklearn.naive_bayes import BernoulliNB
 # xzl: this???
 os.environ["WANDB_DISABLED"] = "true"
 
-device = torch.device("cuda:2") if torch.cuda.is_available() else torch.device("cpu")
+device = torch.device("cuda:1") if torch.cuda.is_available() else torch.device("cpu")
 # xzl
 # hyperparamters
 config_batch_size = 8
@@ -24,6 +24,9 @@ config_per_sample = True # otherwise per minibatch
 config_n_window = config_batch_size * 16 # mov window avg for cal loss threshold, in num of samples
 config_layer_mask = [1,1,1,1,1,1]   # per layer. 1=train, 0=freeze
 # config_layer_mask = [0,0,0,0,0,1]   # per layer. 1=train, 0=freeze
+config_cls_accuracy = 0.7
+config_stage1 = False
+config_cls_window_size = 8
 
 seed = 0
 np.random.seed(seed)
@@ -98,9 +101,9 @@ eval_dataloader = DataLoader(
     val_set, batch_size=config_batch_size, collate_fn=data_collator
 )
 
-config_num_NB = int(sys.argv[1])
+# config_num_NB = int(sys.argv[1])
 # fixed_loss_threshold = float(sys.argv[2])
-stage0_steps = float(sys.argv[2])
+stage0_steps = int(sys.argv[1])
 optimizer = AdamW(model.parameters(), lr=5e-5)
 num_epochs = 1   # xzl. default:3
 
@@ -140,6 +143,7 @@ bnb = BernoulliNB(binarize=0.0)
 length_loss_list = []
 length_list = []
 classifier_acc = []
+classifier_proba = []
 classifier_correct = 0
 total = 0
 stage1_step_counter = 0
@@ -166,7 +170,7 @@ for epoch in range(num_epochs):
     progress_bar = tqdm(range(len(train_dataloader) * config_batch_size))
 
     for step, batch in enumerate(train_dataloader):
-        print(loss_threshold)
+        print("Loss threshold: "+str(loss_threshold))
         ###############Stage 0################
         batch = {k: v.to(device) for k, v in batch.items()}
         # Fwd the whole batch
@@ -190,17 +194,23 @@ for epoch in range(num_epochs):
                 features = bow
                 target = np.array(loss.detach().cpu().numpy() > loss_threshold).astype(np.int32)
                 bnb.partial_fit(features,y=target, classes=np.array([0,1]))
-                # print(( "stage 1:", loss_threshold))
+                pred = bnb.predict(features)
+                proba = bnb.predict_proba(features)
+                # print(proba)
+                total += config_batch_size
+                classifier_correct += (target == pred).astype(np.int32).sum()
+                print('Classifier Accuracy. Test on train set:', classifier_correct / total)
+                classifier_acc.append(classifier_correct / total)
+                classifier_proba.append(proba)
 
                 ###############Stage 2################
-                if stage1_step_counter >= config_num_NB:
-                    pred = bnb.predict(features)
-                    # print(pred, target)
-                    total += config_batch_size
-                    classifier_correct += (target == pred).astype(np.int32).sum()
-                    print('Classifier Accuracy. Test on train set:', classifier_correct/total)
-                    classifier_acc.append(classifier_correct/total)
-
+                # if stage1_step_counter >= config_num_NB:
+                if config_stage1 == False and len(classifier_acc) >= config_cls_window_size:
+                    print(('Average Classifier Accuracy in Window', sum(classifier_acc[-config_cls_window_size:]) / config_cls_window_size))
+                    if sum(classifier_acc[-config_cls_window_size:]) / config_cls_window_size >= config_cls_accuracy:
+                        config_stage1 = True
+                        print("Switch to Stage2")
+                if config_stage1:
                     # backprop based on loss threshold
                     for idx, l in enumerate(pred):
                         if l == 1:
@@ -271,15 +281,15 @@ for epoch in range(num_epochs):
         else:
             loss_history_eff = np.append(loss_history_eff, loss.item())
 
-        if step >= config_num_NB:
-            predictions = torch.argmax(outputs.logits, dim=-1)
-            metric_train.add_batch(predictions=predictions, references=batch["labels"])
+        # if step >= config_num_NB:
+        #     predictions = torch.argmax(outputs.logits, dim=-1)
+        #     metric_train.add_batch(predictions=predictions, references=batch["labels"])
         progress_bar.update(config_batch_size)
 
     avg_train_loss = total_loss / (len(train_dataloader) - skip_counter / config_batch_size)  # xzl
     loss_values.append(avg_train_loss)
 
-    print("\nTraining Accuracy: ", metric_train.compute())
+    # print("\nTraining Accuracy: ", metric_train.compute())
     print("  Average training loss: {:}".format(avg_train_loss))
     print("  Training epcoh took: {:}m {:}s".format(*epoch_time(t0, time.time())))
     skip_ratio = 100 * skip_counter / config_batch_size / len(train_dataloader)
@@ -317,8 +327,8 @@ for epoch in range(num_epochs):
     print("  Validation took: {:}m {:}s".format(*epoch_time(t0, time.time())))
     val_acc = metric_test.compute()['accuracy']
     print("Validation Accuracy: ", val_acc)
-    np.save("0find1adp2fix/{}_stage0_{}_stage1_SkipRatio_ValAcc_ClsAcc.npy".format(stage0_steps, config_num_NB), np.array([skip_ratio, val_acc, classifier_acc[-1]]))
-    np.save("0find1adp2fix/{}_stage0_{}_stage1_ClsAcc_all.npy".format(stage0_steps, config_num_NB), np.array(classifier_acc))
+    # np.save("0find1adp2fix/{}_stage0_SkipRatio_ValAcc_ClsAcc.npy".format(stage0_steps), np.array([skip_ratio, val_acc, classifier_acc[-1]]))
+    # np.save("0find1adp2fix/{}_stage0_ClsAcc_all.npy".format(stage0_steps), np.array(classifier_acc))
 
 
 # print(loss_history)
