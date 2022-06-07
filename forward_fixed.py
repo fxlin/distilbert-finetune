@@ -164,6 +164,7 @@ classifier_proba = []
 classifier_correct = 0
 total = 0
 step_counter = 0
+fixed_adp_threshold = 0
 
 for epoch in range(num_epochs):
 
@@ -195,11 +196,30 @@ for epoch in range(num_epochs):
         outputs = model(**batch)
 
         loss = torch.nn.CrossEntropyLoss(reduction='none')(outputs.logits,batch['labels'])  # per example loss
-        # loss history of all samples... discarded or not ...
         loss_history = np.concatenate((loss_history, loss.cpu().detach().numpy()))
-        # if loss_threshold <= fixed_loss_threshold and loss_threshold != -1:
+        # adjust loss threshold ... moving avg
 
-        if step_counter > stage0_steps:
+        if step_counter <= stage0_steps:
+            for idx, l in enumerate(loss):
+                if l >= loss_threshold:
+                    for k in ['input_ids', 'attention_mask', 'labels']:
+                        # staged_batch[k] = torch.cat(staged_batch[k], batch[k][idx])
+                        staged_batch[k].append(batch[k][idx])
+                else:
+                    skip_counter += 1
+
+            if len(loss_history) > config_n_window:
+                loss_threshold = np.average(loss_history[-config_n_window:])
+
+            n_batches = len(staged_batch['input_ids'])
+            if n_batches < config_batch_size:
+                continue
+
+            for k in ['input_ids', 'attention_mask', 'labels']:
+                batch[k] = torch.stack(staged_batch[k][0:config_batch_size]).to(device)  # already on device??
+                staged_batch[k] = staged_batch[k][config_batch_size:]
+
+        else:
             # Naive Bayes Classification
             bow = np.zeros((batch['input_ids'].shape[0], tokenizer.vocab_size))
             for i in range(batch['input_ids'].shape[0]):
@@ -228,7 +248,7 @@ for epoch in range(num_epochs):
                         print("Switch to Stage2")
                 if config_stage2_start:
                     # backprop based on loss threshold
-                    print('stage 22222')
+                    # print('stage 22222')
                     for idx, l in enumerate(pred):
                         if l == 1:
                             for k in ['input_ids', 'attention_mask', 'labels']:
@@ -240,16 +260,17 @@ for epoch in range(num_epochs):
                 ###############Stage 1################
                 else:
                     for idx, l in enumerate(loss):
+                        # print('stage 11111')
                         if l >= loss_threshold:
                             for k in ['input_ids', 'attention_mask', 'labels']:
                                 # staged_batch[k] = torch.cat(staged_batch[k], batch[k][idx])
                                 staged_batch[k].append(batch[k][idx])
                         else:
                             skip_counter += 1
-                    # adjust loss threshold ... moving avg
-                    if len(loss_history) > config_n_window:
-                        loss_threshold = np.average(loss_history[-config_n_window:])
-                        loss_threshold_history.append((step * config_batch_size - skip_counter, loss_threshold))
+                    # # adjust loss threshold ... moving avg
+                    # if len(loss_history) > config_n_window:
+                    #     loss_threshold = np.average(loss_history[-config_n_window:])
+                    #     loss_threshold_history.append((step * config_batch_size - skip_counter, loss_threshold))
 
                 n_batches = len(staged_batch['input_ids'])
                 if n_batches < config_batch_size:
@@ -345,9 +366,9 @@ for epoch in range(num_epochs):
     print("  Validation took: {:}m {:}s".format(*epoch_time(t0, time.time())))
     val_acc = metric_test.compute()['accuracy']
     print("Validation Accuracy: ", val_acc)
-    with open('{}_claloss_Skipratio_Valacc.csv'.format(actual_task), 'a', newline='') as f:
+    with open('adp0_{}_claloss_Skipratio_Valacc.csv'.format(actual_task), 'a', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow([stage0_steps, config_cls_loss, config_cls_window_size, config_stage2_start, skip_ratio, val_acc])
+        writer.writerow([stage0_steps, config_cls_loss, config_cls_window_size, config_stage2_start, val_acc, skip_ratio])
 
 
 # print(loss_history)
