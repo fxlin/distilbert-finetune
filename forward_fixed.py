@@ -25,6 +25,7 @@ config_n_window = config_batch_size * 16 # mov window avg for cal loss threshold
 config_layer_mask = [1,1,1,1,1,1]   # per layer. 1=train, 0=freeze
 # config_layer_mask = [0,0,0,0,0,1]   # per layer. 1=train, 0=freeze
 # config_cls_accuracy = 0.7
+config_stage1_start = False
 config_stage2_start = False
 config_cls_window_size = 8
 
@@ -133,11 +134,13 @@ num_training_steps=num_training_steps,
 print(num_training_steps)
 
 # set stage0 steps from int to percentage
-stage0_steps = 0.01 * stage0_steps * num_training_steps
+stage0_steps = int(0.01 * stage0_steps * num_training_steps)
 model.to(device)
 
 included_batches = list(range(0, len(train_dataloader)))
 skip_counter = 0  # how many sample skipped
+forward_skip_counter = 0
+backward_skip_counter = 0
 #loss_history = []
 loss_history = np.array([], dtype=np.float32)
 loss_history_eff = np.array([], dtype=np.float32)   # effective. actual loss in training
@@ -184,41 +187,26 @@ for epoch in range(num_epochs):
     # Reset the total loss for this epoch.
     total_loss = 0
     skip_counter = 0
+    forward_skip_counter = 0
+    backward_skip_counter = 0
 
     progress_bar = tqdm(range(len(train_dataloader) * config_batch_size))
 
     for step, batch in enumerate(train_dataloader):
         print("Loss threshold: "+str(loss_threshold))
-        ###############Stage 0################
         batch = {k: v.to(device) for k, v in batch.items()}
         # Fwd the whole batch
         model.eval()
         outputs = model(**batch)
 
-        loss = torch.nn.CrossEntropyLoss(reduction='none')(outputs.logits,batch['labels'])  # per example loss
+        loss = torch.nn.CrossEntropyLoss(reduction='none')(outputs.logits, batch['labels'])  # per example loss
         loss_history = np.concatenate((loss_history, loss.cpu().detach().numpy()))
-        # adjust loss threshold ... moving avg
-
-        if step_counter <= stage0_steps:
-            for idx, l in enumerate(loss):
-                if l >= loss_threshold:
-                    for k in ['input_ids', 'attention_mask', 'labels']:
-                        # staged_batch[k] = torch.cat(staged_batch[k], batch[k][idx])
-                        staged_batch[k].append(batch[k][idx])
-                else:
-                    skip_counter += 1
-
+        ###############Stage 0################
+        if step_counter < stage0_steps:
             if len(loss_history) > config_n_window:
                 loss_threshold = np.average(loss_history[-config_n_window:])
-
-            n_batches = len(staged_batch['input_ids'])
-            if n_batches < config_batch_size:
-                continue
-
-            for k in ['input_ids', 'attention_mask', 'labels']:
-                batch[k] = torch.stack(staged_batch[k][0:config_batch_size]).to(device)  # already on device??
-                staged_batch[k] = staged_batch[k][config_batch_size:]
-
+        elif step_counter == stage0_steps:
+            config_stage1_start = True
         else:
             # Naive Bayes Classification
             bow = np.zeros((batch['input_ids'].shape[0], tokenizer.vocab_size))
@@ -229,36 +217,18 @@ for epoch in range(num_epochs):
             if config_per_sample:
                 features = bow
                 target = np.array(loss.detach().cpu().numpy() > loss_threshold).astype(np.int32)
-                # print(batch['input_ids'].shape[0], len(target))
-                bnb.partial_fit(features,y=target, classes=np.array([0,1]))
-                pred = bnb.predict(features)
-                proba = -np.average(bnb.predict_log_proba(features)[np.arange(batch['input_ids'].shape[0]),target])
-                total += config_batch_size
-                classifier_correct += (target == pred).astype(np.int32).sum()
-                print('Classifier Loss. Test on train set:', proba)
-                classifier_acc.append(classifier_correct / total)
-                classifier_proba.append(proba)
+                if config_stage1_start:
+                    print("START 1111")
+                    bnb.partial_fit(features,y=target, classes=np.array([0,1]))
+                    pred = bnb.predict(features)
+                    proba = -np.average(bnb.predict_log_proba(features)[np.arange(batch['input_ids'].shape[0]),target])
+                    total += config_batch_size
+                    classifier_correct += (target == pred).astype(np.int32).sum()
+                    # print('Classifier Loss. Test on train set:', proba)
+                    classifier_acc.append(classifier_correct / total)
+                    classifier_proba.append(proba)
 
-                ###############Stage 2################
-                # if stage1_step_counter >= config_num_NB:
-                if config_stage2_start == False and len(classifier_proba) >= config_cls_window_size:
-                    print(('Average Classifier Loss in Window', sum(classifier_proba[-config_cls_window_size:]) / config_cls_window_size))
-                    if sum(classifier_proba[-config_cls_window_size:]) / config_cls_window_size <= config_cls_loss:
-                        config_stage2_start = True
-                        print("Switch to Stage2")
-                if config_stage2_start:
-                    # backprop based on loss threshold
-                    # print('stage 22222')
-                    for idx, l in enumerate(pred):
-                        if l == 1:
-                            for k in ['input_ids', 'attention_mask', 'labels']:
-                                # staged_batch[k] = torch.cat(staged_batch[k], batch[k][idx])
-                                staged_batch[k].append(batch[k][idx])
-                        else:
-                            skip_counter += 1
-
-                ###############Stage 1################
-                else:
+                    ###############Stage 1################
                     for idx, l in enumerate(loss):
                         # print('stage 11111')
                         if l >= loss_threshold:
@@ -266,11 +236,33 @@ for epoch in range(num_epochs):
                                 # staged_batch[k] = torch.cat(staged_batch[k], batch[k][idx])
                                 staged_batch[k].append(batch[k][idx])
                         else:
-                            skip_counter += 1
-                    # # adjust loss threshold ... moving avg
-                    # if len(loss_history) > config_n_window:
-                    #     loss_threshold = np.average(loss_history[-config_n_window:])
-                    #     loss_threshold_history.append((step * config_batch_size - skip_counter, loss_threshold))
+                            # skip_counter += 1
+                            backward_skip_counter += 1
+
+                ###############Stage 2################
+                # if stage1_step_counter >= config_num_NB:
+                if config_stage2_start == False and len(classifier_proba) >= config_cls_window_size:
+                    print(('Average Classifier Loss in Window', sum(classifier_proba[-config_cls_window_size:]) / config_cls_window_size))
+                    if sum(classifier_proba[-config_cls_window_size:]) / config_cls_window_size <= config_cls_loss:
+                        config_stage2_start = True
+                        config_stage1_start = False
+                        print("Switch to Stage2")
+                if config_stage2_start:
+                    pred = bnb.predict(features)
+                    # backprop based on loss threshold
+                    print('stage 22222')
+                    for idx, l in enumerate(pred):
+                        if l == 1:
+                            bnb.partial_fit(features, y=target, classes=np.array([0, 1]))
+                            if loss[idx] > loss_threshold:
+                                for k in ['input_ids', 'attention_mask', 'labels']:
+                                    # staged_batch[k] = torch.cat(staged_batch[k], batch[k][idx])
+                                    staged_batch[k].append(batch[k][idx])
+                            else:
+                                backward_skip_counter += 1
+                        else:
+                            forward_skip_counter += 1
+                            backward_skip_counter += 1
 
                 n_batches = len(staged_batch['input_ids'])
                 if n_batches < config_batch_size:
@@ -319,9 +311,6 @@ for epoch in range(num_epochs):
         else:
             loss_history_eff = np.append(loss_history_eff, loss.item())
 
-        # if step >= config_num_NB:
-        #     predictions = torch.argmax(outputs.logits, dim=-1)
-        #     metric_train.add_batch(predictions=predictions, references=batch["labels"])
         step_counter += 1
         progress_bar.update(config_batch_size)
 
@@ -331,8 +320,10 @@ for epoch in range(num_epochs):
     # print("\nTraining Accuracy: ", metric_train.compute())
     print("  Average training loss: {:}".format(avg_train_loss))
     print("  Training epcoh took: {:}m {:}s".format(*epoch_time(t0, time.time())))
-    skip_ratio = 100 * skip_counter / config_batch_size / len(train_dataloader)
-    print(f" skipped {skip_counter} samples, {skip_ratio:.2f}%",
+    # skip_ratio = 100 * skip_counter / config_batch_size / len(train_dataloader)
+    forward_skip_ratio = 100 * forward_skip_counter / config_batch_size / len(train_dataloader)
+    backward_skip_ratio = 100 * backward_skip_counter / config_batch_size / len(train_dataloader)
+    print(f" forward skip ratio {forward_skip_ratio:.2f}%, backward skip ratio {backward_skip_ratio:.2f}%",
           "loss_threshold", loss_threshold)
 
     # ========================================
@@ -366,9 +357,9 @@ for epoch in range(num_epochs):
     print("  Validation took: {:}m {:}s".format(*epoch_time(t0, time.time())))
     val_acc = metric_test.compute()['accuracy']
     print("Validation Accuracy: ", val_acc)
-    with open('adp0_{}_claloss_Skipratio_Valacc.csv'.format(actual_task), 'a', newline='') as f:
+    with open('final_{}_claloss_Skipratio_Valacc.csv'.format(actual_task), 'a', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow([stage0_steps, config_cls_loss, config_cls_window_size, config_stage2_start, val_acc, skip_ratio])
+        writer.writerow([stage0_steps, config_cls_loss, config_cls_window_size, config_stage2_start, val_acc, forward_skip_ratio, backward_skip_ratio])
 
 
 # print(loss_history)
